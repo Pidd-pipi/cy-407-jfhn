@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <h1>展览管理</h1>
-        <p>创建展览、调整展品顺序、设置主题色并发布到 3D 展厅。</p>
+        <p>创建展览、调整展品顺序、规划墙面槽位、设置主题色并发布到 3D 展厅。</p>
       </div>
       <n-button type="primary" @click="startCreate">新建展览</n-button>
     </div>
@@ -25,6 +25,10 @@
           <h2>{{ isCreating ? '创建展览' : '编辑展览' }}</h2>
           <n-button v-if="selectedId" quaternary type="error" @click="deleteSelected">删除</n-button>
         </header>
+        <n-alert v-if="selected && selected.publishedSnapshot" type="success" :show-icon="false" class="publish-hint">
+          当前展厅读取的是 {{ formatPublishedAt(selected.publishedSnapshot.publishedAt) }}
+          发布的快照；此后的修改仅更新草稿，重新发布后才会同步到展厅。
+        </n-alert>
         <n-form label-placement="top" :show-feedback="false" class="form-stack">
           <n-form-item label="标题">
             <n-input v-model:value="draft.title" placeholder="展览标题" />
@@ -49,6 +53,19 @@
             </n-form-item>
           </div>
           <ArtifactPicker v-model="draft.artifactIds" :artifacts="artifactStore.artifacts" />
+          <LayoutPlanner v-model="draft.layout" :artifacts="pickedArtifacts" />
+          <n-alert
+            :type="layoutValidation.valid ? 'default' : 'error'"
+            :show-icon="!layoutValidation.valid"
+            class="layout-validation"
+          >
+            <template v-if="layoutValidation.valid">
+              布置方案有效：{{ draft.artifactIds.length }} 件展品各占一个唯一槽位，可发布。
+            </template>
+            <template v-else>
+              <p v-for="error in layoutValidation.errors" :key="error" class="validation-error">{{ error }}</p>
+            </template>
+          </n-alert>
           <section class="picked-artifacts">
             <h3>已选展品预览</h3>
             <ArtifactCard
@@ -60,7 +77,7 @@
             />
           </section>
           <div class="form-actions">
-            <n-button type="primary" @click="saveExhibition">{{ isCreating ? '创建' : '保存' }}</n-button>
+            <n-button type="primary" @click="saveExhibition">{{ isCreating ? '创建' : '保存草稿' }}</n-button>
             <n-button v-if="selectedId" secondary @click="publishSelected">发布</n-button>
           </div>
         </n-form>
@@ -74,12 +91,14 @@ import { computed, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { useMessage } from 'naive-ui';
 import ArtifactPicker from '@/components/editor/ArtifactPicker.vue';
+import LayoutPlanner from '@/components/editor/LayoutPlanner.vue';
 import ArtifactCard from '@/components/common/ArtifactCard.vue';
 import ExhibitionCard from '@/components/common/ExhibitionCard.vue';
 import { useArtifactStore } from '@/stores/artifact';
 import { useExhibitionStore } from '@/stores/exhibition';
 import type { Artifact, ExhibitionDraft } from '@/types';
 import { ExhibitionStatus, exhibitionStatusLabels } from '@/types';
+import { syncPlacements, validateLayout } from '@/utils/exhibition-layout';
 
 const router = useRouter();
 const message = useMessage();
@@ -95,6 +114,7 @@ const pickedArtifacts = computed<Artifact[]>(() =>
   draft.artifactIds.map((id) => artifactStore.getById(id)).filter((artifact): artifact is Artifact => Boolean(artifact))
 );
 const statusOptions = Object.values(ExhibitionStatus).map((value) => ({ label: exhibitionStatusLabels[value], value }));
+const layoutValidation = computed(() => validateLayout(draft.artifactIds, draft.layout));
 
 watch(
   selected,
@@ -107,20 +127,30 @@ watch(
       artifactIds: [...value.artifactIds],
       themeColor: value.themeColor,
       backgroundMusicUrl: value.backgroundMusicUrl ?? '',
+      layout: syncPlacements(value.artifactIds, value.layout ?? []),
       status: value.status
     });
   },
   { immediate: true }
 );
 
+watch(
+  () => draft.artifactIds,
+  (artifactIds) => {
+    draft.layout = syncPlacements(artifactIds, draft.layout);
+  }
+);
+
 function emptyDraft(): ExhibitionDraft {
+  const artifactIds = artifactStore.artifacts.map((artifact) => artifact.id);
   return {
     title: '',
     intro: '',
     curator: '',
-    artifactIds: artifactStore.artifacts.map((artifact) => artifact.id),
+    artifactIds,
     themeColor: '#173f35',
     backgroundMusicUrl: '',
+    layout: syncPlacements(artifactIds, []),
     status: ExhibitionStatus.Draft
   };
 }
@@ -136,28 +166,48 @@ function selectExhibition(id: string) {
   selectedId.value = id;
 }
 
+function draftPayload(): ExhibitionDraft {
+  return {
+    ...draft,
+    artifactIds: [...draft.artifactIds],
+    layout: syncPlacements(draft.artifactIds, draft.layout)
+  };
+}
+
 async function saveExhibition() {
   if (!draft.title.trim()) {
     message.warning('请填写展览标题');
     return;
   }
+  const payload = draftPayload();
   if (isCreating.value) {
-    const created = await exhibitionStore.createExhibition({ ...draft, artifactIds: [...draft.artifactIds] });
+    const created = await exhibitionStore.createExhibition(payload);
     selectedId.value = created.id;
     isCreating.value = false;
     message.success('展览已创建');
     return;
   }
   if (selectedId.value) {
-    await exhibitionStore.updateExhibition(selectedId.value, { ...draft, artifactIds: [...draft.artifactIds] });
-    message.success('展览已保存');
+    await exhibitionStore.updateExhibition(selectedId.value, payload);
+    message.success('草稿已保存');
   }
 }
 
 async function publishSelected() {
   if (!selectedId.value) return;
-  await exhibitionStore.publishExhibition(selectedId.value);
-  message.success('展览已发布');
+  if (!draft.title.trim()) {
+    message.warning('请填写展览标题');
+    return;
+  }
+  // 先持久化草稿，再校验发布；发布失败时草稿与既有快照都保留
+  await exhibitionStore.updateExhibition(selectedId.value, draftPayload());
+  const result = await exhibitionStore.publishExhibition(selectedId.value);
+  if (result.ok) {
+    draft.status = ExhibitionStatus.Published;
+    message.success('展览已发布，顺序、主题色与布置方案已冻结');
+  } else {
+    message.error(`发布失败：${result.errors.join('；')}`);
+  }
 }
 
 async function deleteSelected() {
@@ -167,6 +217,10 @@ async function deleteSelected() {
   isCreating.value = !selectedId.value;
   Object.assign(draft, selected.value ?? emptyDraft());
   message.success('展览已删除');
+}
+
+function formatPublishedAt(iso: string): string {
+  return new Date(iso).toLocaleString('zh-CN', { hour12: false });
 }
 </script>
 
@@ -202,6 +256,10 @@ async function deleteSelected() {
   gap: 12px;
 }
 
+.publish-hint {
+  line-height: 1.55;
+}
+
 .picked-artifacts {
   display: grid;
   gap: 10px;
@@ -227,6 +285,14 @@ async function deleteSelected() {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+}
+
+.layout-validation .validation-error {
+  margin: 0;
+}
+
+.layout-validation .validation-error + .validation-error {
+  margin-top: 4px;
 }
 
 @media (max-width: 1080px) {

@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia';
 import { exhibitionRepository } from '@/api/storage';
-import { ExhibitionStatus, type Exhibition, type ExhibitionDraft } from '@/types';
+import { ExhibitionStatus, type Exhibition, type ExhibitionDraft, type ExhibitionSnapshot } from '@/types';
 import { createId } from '@/utils/storage';
+import { validateLayout } from '@/utils/exhibition-layout';
 import { useArtifactStore } from './artifact';
 
 function createSeedExhibition(artifactIds: string[]): Exhibition {
@@ -14,11 +15,14 @@ function createSeedExhibition(artifactIds: string[]): Exhibition {
     artifactIds,
     themeColor: '#173f35',
     backgroundMusicUrl: '',
+    layout: [],
     status: ExhibitionStatus.Published,
     createdAt: now,
     updatedAt: now
   };
 }
+
+export type PublishResult = { ok: true } | { ok: false; errors: string[] };
 
 export const useExhibitionStore = defineStore('exhibition', {
   state: () => ({
@@ -38,7 +42,7 @@ export const useExhibitionStore = defineStore('exhibition', {
         await exhibitionRepository.save(seed);
         this.exhibitions = [seed];
       } else {
-        this.exhibitions = records;
+        this.exhibitions = records.map((record) => ({ ...record, layout: record.layout ?? [] }));
       }
       this.loaded = true;
     },
@@ -46,6 +50,7 @@ export const useExhibitionStore = defineStore('exhibition', {
       const now = new Date().toISOString();
       const exhibition: Exhibition = {
         ...draft,
+        layout: draft.layout ?? [],
         id: createId('exhibition'),
         createdAt: now,
         updatedAt: now
@@ -57,7 +62,12 @@ export const useExhibitionStore = defineStore('exhibition', {
     async updateExhibition(id: string, patch: Partial<ExhibitionDraft>) {
       const current = this.getById(id);
       if (!current) return;
-      const updated: Exhibition = { ...current, ...patch, updatedAt: new Date().toISOString() };
+      const updated: Exhibition = {
+        ...current,
+        ...patch,
+        layout: patch.layout ?? current.layout ?? [],
+        updatedAt: new Date().toISOString()
+      };
       this.exhibitions = this.exhibitions.map((exhibition) => (exhibition.id === id ? updated : exhibition));
       await exhibitionRepository.save(updated);
     },
@@ -68,8 +78,52 @@ export const useExhibitionStore = defineStore('exhibition', {
     async reorderArtifacts(id: string, artifactIds: string[]) {
       await this.updateExhibition(id, { artifactIds });
     },
-    async publishExhibition(id: string) {
-      await this.updateExhibition(id, { status: ExhibitionStatus.Published });
+    /**
+     * 发布：先校验布置方案，通过后冻结顺序、主题色和布置快照。
+     * 校验失败（未覆盖全部展品、槽位重复、超过十二个）时返回错误，
+     * 草稿与既有快照均保持不变。
+     */
+    async publishExhibition(id: string, draftPatch?: Partial<ExhibitionDraft>): Promise<PublishResult> {
+      const current = this.getById(id);
+      if (!current) return { ok: false, errors: ['展览不存在'] };
+
+      const candidate: ExhibitionDraft = {
+        title: draftPatch?.title ?? current.title,
+        intro: draftPatch?.intro ?? current.intro,
+        curator: draftPatch?.curator ?? current.curator,
+        artifactIds: draftPatch?.artifactIds ?? current.artifactIds,
+        themeColor: draftPatch?.themeColor ?? current.themeColor,
+        backgroundMusicUrl: draftPatch?.backgroundMusicUrl ?? current.backgroundMusicUrl,
+        layout: draftPatch?.layout ?? current.layout ?? [],
+        status: ExhibitionStatus.Published
+      };
+
+      const validation = validateLayout(candidate.artifactIds, candidate.layout);
+      if (!validation.valid) {
+        return { ok: false, errors: validation.errors };
+      }
+
+      const snapshot: ExhibitionSnapshot = {
+        artifactIds: [...candidate.artifactIds],
+        themeColor: candidate.themeColor,
+        layout: candidate.artifactIds
+          .map((artifactId) =>
+            candidate.layout.find((placement) => placement.artifactId === artifactId)
+          )
+          .filter((placement): placement is NonNullable<typeof placement> => Boolean(placement))
+          .map((placement) => ({ ...placement })),
+        publishedAt: new Date().toISOString()
+      };
+
+      const updated: Exhibition = {
+        ...current,
+        ...candidate,
+        publishedSnapshot: snapshot,
+        updatedAt: snapshot.publishedAt
+      };
+      this.exhibitions = this.exhibitions.map((exhibition) => (exhibition.id === id ? updated : exhibition));
+      await exhibitionRepository.save(updated);
+      return { ok: true };
     },
     async unpublishExhibition(id: string) {
       await this.updateExhibition(id, { status: ExhibitionStatus.Draft });

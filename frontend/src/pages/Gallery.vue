@@ -7,6 +7,9 @@
       </div>
       <div class="gallery-actions">
         <n-tag :bordered="false">{{ exhibition.curator }}</n-tag>
+        <n-tag v-if="snapshot" :bordered="false" type="success">
+          快照 {{ formatPublishedAt(snapshot.publishedAt) }}
+        </n-tag>
         <n-button secondary @click="toggleTour">{{ isTouring ? '暂停导览' : '自动导览' }}</n-button>
       </div>
     </div>
@@ -48,9 +51,10 @@ import { useAnnotationStore } from '@/stores/annotation';
 import { useArtifactStore } from '@/stores/artifact';
 import { useExhibitionStore } from '@/stores/exhibition';
 import { useTourStore } from '@/stores/tour';
-import type { Artifact, Tour } from '@/types';
+import type { Artifact, ExhibitionSnapshot, Tour } from '@/types';
 import { createGalleryHall, loadArtifactObject } from '@/utils/model-loader';
 import { disposeObject3D } from '@/utils/renderer';
+import { applyAutoPosition, applySlotPlacement, resolveSlotPlacements } from '@/utils/exhibition-layout';
 import { createTourPlayer, type TourPlayerControls } from '@/utils/tour-player';
 
 const route = useRoute();
@@ -75,10 +79,26 @@ const exhibition = computed(() => {
   return exhibitionStore.getById(id) ?? exhibitionStore.exhibitions[0];
 });
 
+/** 展厅读取最近一次成功发布冻结的快照；旧展览没有快照时沿用草稿数据 + 自动排位 */
+const snapshot = computed<ExhibitionSnapshot | undefined>(() => exhibition.value?.publishedSnapshot);
+
+const liveArtifactIds = computed(() => snapshot.value?.artifactIds ?? exhibition.value?.artifactIds ?? []);
+const liveThemeColor = computed(() => snapshot.value?.themeColor ?? exhibition.value?.themeColor ?? '#173f35');
+const liveLayout = computed(() => snapshot.value?.layout ?? exhibition.value?.layout ?? []);
+
 const artifacts = computed<Artifact[]>(() => {
-  const ids = exhibition.value?.artifactIds ?? [];
-  return ids.map((id) => artifactStore.getById(id)).filter((artifact): artifact is Artifact => Boolean(artifact));
+  return liveArtifactIds.value
+    .map((id) => artifactStore.getById(id))
+    .filter((artifact): artifact is Artifact => Boolean(artifact));
 });
+
+/** 槽位布置：每件展品唯一槽位时生效，否则（旧展览/数据不完整）沿用自动排位 */
+const slotPlacements = computed(() =>
+  resolveSlotPlacements(
+    artifacts.value.map((artifact) => artifact.id),
+    liveLayout.value
+  )
+);
 
 const selectedArtifact = computed(() => artifactStore.getById(selectedArtifactId.value ?? ''));
 const activeTour = computed<Tour | undefined>(() => {
@@ -86,7 +106,17 @@ const activeTour = computed<Tour | undefined>(() => {
   return tourStore.byExhibitionId(exhibition.value.id)[0];
 });
 
-const sceneKey = computed(() => `${three.ready.value}-${exhibition.value?.id}-${artifacts.value.map((item) => item.id).join('|')}`);
+const sceneKey = computed(() => {
+  const placementKey = slotPlacements.value
+    ? artifacts.value
+        .map((artifact) => {
+          const placement = slotPlacements.value?.get(artifact.id);
+          return placement ? `${artifact.id}@${placement.slot}:${placement.facing}:${placement.scale}` : artifact.id;
+        })
+        .join('|')
+    : `auto-${artifacts.value.map((artifact) => artifact.id).join('|')}`;
+  return `${three.ready.value}-${exhibition.value?.id}-${snapshot.value?.publishedAt ?? 'draft'}-${liveThemeColor.value}-${placementKey}`;
+});
 
 function onSceneReady(element: HTMLElement) {
   containerRef.value = element;
@@ -100,13 +130,17 @@ async function rebuildScene() {
     disposeObject3D(sceneRoot);
   }
 
-  const root = createGalleryHall(exhibition.value.themeColor);
-  const spacing = 4.1;
+  const root = createGalleryHall(liveThemeColor.value);
+  const placements = slotPlacements.value;
   await Promise.all(
     artifacts.value.map(async (artifact, index) => {
       const object = await loadArtifactObject(artifact);
-      object.position.set((index - (artifacts.value.length - 1) / 2) * spacing, 0, index % 2 === 0 ? -1.35 : 1.2);
-      object.rotation.y = index % 2 === 0 ? 0.16 : -0.24;
+      const placement = placements?.get(artifact.id);
+      if (placement) {
+        applySlotPlacement(object, placement);
+      } else {
+        applyAutoPosition(object, index, artifacts.value.length);
+      }
       object.userData.artifactId = artifact.id;
       root.add(object);
     })
@@ -140,6 +174,10 @@ function handleSceneClick(event: MouseEvent) {
   if (artifactId) {
     selectedArtifactId.value = artifactId;
   }
+}
+
+function formatPublishedAt(iso: string): string {
+  return new Date(iso).toLocaleString('zh-CN', { hour12: false });
 }
 
 function toggleTour() {
