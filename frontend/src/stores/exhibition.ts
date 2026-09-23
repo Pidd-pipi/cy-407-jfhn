@@ -1,11 +1,18 @@
 import { defineStore } from 'pinia';
 import { exhibitionRepository } from '@/api/storage';
-import { ExhibitionStatus, type Exhibition, type ExhibitionDraft } from '@/types';
+import { ExhibitionStatus, type Exhibition, type ExhibitionDraft, type ExhibitionSnapshot } from '@/types';
+import { validateExhibitionLayout } from '@/utils/exhibition-layout';
 import { createId } from '@/utils/storage';
 import { useArtifactStore } from './artifact';
 
 function createSeedExhibition(artifactIds: string[]): Exhibition {
   const now = new Date().toISOString();
+  const layout = artifactIds.slice(0, 12).map((artifactId, index) => ({
+    artifactId,
+    slot: index + 1,
+    rotation: 0,
+    scale: 1
+  }));
   return {
     id: 'exhibition-heritage-hall',
     title: '手作纹理常设展',
@@ -15,6 +22,13 @@ function createSeedExhibition(artifactIds: string[]): Exhibition {
     themeColor: '#173f35',
     backgroundMusicUrl: '',
     status: ExhibitionStatus.Published,
+    layout,
+    publishedSnapshot: {
+      artifactIds: [...artifactIds],
+      themeColor: '#173f35',
+      layout: layout.map((placement) => ({ ...placement })),
+      publishedAt: now
+    },
     createdAt: now,
     updatedAt: now
   };
@@ -68,8 +82,32 @@ export const useExhibitionStore = defineStore('exhibition', {
     async reorderArtifacts(id: string, artifactIds: string[]) {
       await this.updateExhibition(id, { artifactIds });
     },
-    async publishExhibition(id: string) {
-      await this.updateExhibition(id, { status: ExhibitionStatus.Published });
+    async publishExhibition(id: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+      const current = this.getById(id);
+      if (!current) return { ok: false, reason: '展览不存在' };
+
+      const layout = (current.layout ?? []).map((placement) => ({ ...placement }));
+      const problems = validateExhibitionLayout(current.artifactIds, layout);
+      if (problems.length > 0) {
+        // 发布失败：草稿与既有快照保持不变
+        return { ok: false, reason: problems.join('；') };
+      }
+
+      const snapshot: ExhibitionSnapshot = {
+        artifactIds: [...current.artifactIds],
+        themeColor: current.themeColor,
+        layout,
+        publishedAt: new Date().toISOString()
+      };
+      const updated: Exhibition = {
+        ...current,
+        status: ExhibitionStatus.Published,
+        publishedSnapshot: snapshot,
+        updatedAt: new Date().toISOString()
+      };
+      this.exhibitions = this.exhibitions.map((exhibition) => (exhibition.id === id ? updated : exhibition));
+      await exhibitionRepository.save(updated);
+      return { ok: true };
     },
     async unpublishExhibition(id: string) {
       await this.updateExhibition(id, { status: ExhibitionStatus.Draft });

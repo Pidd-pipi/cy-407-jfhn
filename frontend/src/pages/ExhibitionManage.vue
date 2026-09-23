@@ -37,7 +37,15 @@
               <n-input v-model:value="draft.curator" />
             </n-form-item>
             <n-form-item label="状态">
-              <n-select v-model:value="draft.status" :options="statusOptions" />
+              <div class="status-display">
+                <n-tag :bordered="false" :type="draft.status === ExhibitionStatus.Published ? 'success' : 'default'">
+                  {{ exhibitionStatusLabels[draft.status] }}
+                </n-tag>
+                <small v-if="selected?.publishedSnapshot">
+                  最近发布于 {{ formatTime(selected.publishedSnapshot.publishedAt) }}
+                </small>
+                <small v-else>尚未发布快照</small>
+              </div>
             </n-form-item>
           </div>
           <div class="field-grid">
@@ -49,6 +57,7 @@
             </n-form-item>
           </div>
           <ArtifactPicker v-model="draft.artifactIds" :artifacts="artifactStore.artifacts" />
+          <LayoutPlanner v-model="draft.layout" :artifacts="pickedArtifacts" />
           <section class="picked-artifacts">
             <h3>已选展品预览</h3>
             <ArtifactCard
@@ -74,6 +83,7 @@ import { computed, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { useMessage } from 'naive-ui';
 import ArtifactPicker from '@/components/editor/ArtifactPicker.vue';
+import LayoutPlanner from '@/components/editor/LayoutPlanner.vue';
 import ArtifactCard from '@/components/common/ArtifactCard.vue';
 import ExhibitionCard from '@/components/common/ExhibitionCard.vue';
 import { useArtifactStore } from '@/stores/artifact';
@@ -94,7 +104,6 @@ const selected = computed(() => exhibitionStore.getById(selectedId.value));
 const pickedArtifacts = computed<Artifact[]>(() =>
   draft.artifactIds.map((id) => artifactStore.getById(id)).filter((artifact): artifact is Artifact => Boolean(artifact))
 );
-const statusOptions = Object.values(ExhibitionStatus).map((value) => ({ label: exhibitionStatusLabels[value], value }));
 
 watch(
   selected,
@@ -107,7 +116,8 @@ watch(
       artifactIds: [...value.artifactIds],
       themeColor: value.themeColor,
       backgroundMusicUrl: value.backgroundMusicUrl ?? '',
-      status: value.status
+      status: value.status,
+      layout: (value.layout ?? []).map((placement) => ({ ...placement }))
     });
   },
   { immediate: true }
@@ -121,7 +131,25 @@ function emptyDraft(): ExhibitionDraft {
     artifactIds: artifactStore.artifacts.map((artifact) => artifact.id),
     themeColor: '#173f35',
     backgroundMusicUrl: '',
-    status: ExhibitionStatus.Draft
+    status: ExhibitionStatus.Draft,
+    layout: []
+  };
+}
+
+function formatTime(iso: string): string {
+  return new Date(iso).toLocaleString();
+}
+
+function draftPayload(): ExhibitionDraft {
+  return {
+    title: draft.title,
+    intro: draft.intro,
+    curator: draft.curator,
+    artifactIds: [...draft.artifactIds],
+    themeColor: draft.themeColor,
+    backgroundMusicUrl: draft.backgroundMusicUrl,
+    status: draft.status,
+    layout: draft.layout.map((placement) => ({ ...placement }))
   };
 }
 
@@ -142,22 +170,32 @@ async function saveExhibition() {
     return;
   }
   if (isCreating.value) {
-    const created = await exhibitionStore.createExhibition({ ...draft, artifactIds: [...draft.artifactIds] });
+    const created = await exhibitionStore.createExhibition(draftPayload());
     selectedId.value = created.id;
     isCreating.value = false;
     message.success('展览已创建');
     return;
   }
   if (selectedId.value) {
-    await exhibitionStore.updateExhibition(selectedId.value, { ...draft, artifactIds: [...draft.artifactIds] });
+    await exhibitionStore.updateExhibition(selectedId.value, draftPayload());
     message.success('展览已保存');
   }
 }
 
 async function publishSelected() {
   if (!selectedId.value) return;
-  await exhibitionStore.publishExhibition(selectedId.value);
-  message.success('展览已发布');
+  if (!draft.title.trim()) {
+    message.warning('请填写展览标题');
+    return;
+  }
+  // 先落草稿，再基于草稿冻结快照；校验失败时草稿与既有快照都保留
+  await exhibitionStore.updateExhibition(selectedId.value, draftPayload());
+  const result = await exhibitionStore.publishExhibition(selectedId.value);
+  if (!result.ok) {
+    message.error(`发布失败：${result.reason}。草稿与既有快照已保留。`);
+    return;
+  }
+  message.success('展览已发布，展厅将使用最新快照');
 }
 
 async function deleteSelected() {
@@ -165,7 +203,10 @@ async function deleteSelected() {
   await exhibitionStore.deleteExhibition(selectedId.value);
   selectedId.value = exhibitionStore.exhibitions[0]?.id ?? '';
   isCreating.value = !selectedId.value;
-  Object.assign(draft, selected.value ?? emptyDraft());
+  // 选中新展览时由 watch 同步草稿；没有展览可选时重置为空草稿
+  if (!selected.value) {
+    Object.assign(draft, emptyDraft());
+  }
   message.success('展览已删除');
 }
 </script>
@@ -227,6 +268,18 @@ async function deleteSelected() {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+}
+
+.status-display {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+}
+
+.status-display small {
+  color: rgba(31, 46, 41, 0.56);
 }
 
 @media (max-width: 1080px) {

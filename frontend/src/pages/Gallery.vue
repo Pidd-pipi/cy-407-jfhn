@@ -50,6 +50,7 @@ import { useExhibitionStore } from '@/stores/exhibition';
 import { useTourStore } from '@/stores/tour';
 import type { Artifact, Tour } from '@/types';
 import { createGalleryHall, loadArtifactObject } from '@/utils/model-loader';
+import { getSlotTransform } from '@/utils/exhibition-layout';
 import { disposeObject3D } from '@/utils/renderer';
 import { createTourPlayer, type TourPlayerControls } from '@/utils/tour-player';
 
@@ -75,8 +76,20 @@ const exhibition = computed(() => {
   return exhibitionStore.getById(id) ?? exhibitionStore.exhibitions[0];
 });
 
+// 展厅只读取最近发布快照；没有快照的旧展览回退到当前数据 + 自动排位
+const display = computed(() => {
+  const current = exhibition.value;
+  if (!current) return undefined;
+  const snapshot = current.publishedSnapshot;
+  return {
+    artifactIds: snapshot?.artifactIds ?? current.artifactIds,
+    themeColor: snapshot?.themeColor ?? current.themeColor,
+    layout: snapshot?.layout ?? []
+  };
+});
+
 const artifacts = computed<Artifact[]>(() => {
-  const ids = exhibition.value?.artifactIds ?? [];
+  const ids = display.value?.artifactIds ?? [];
   return ids.map((id) => artifactStore.getById(id)).filter((artifact): artifact is Artifact => Boolean(artifact));
 });
 
@@ -86,7 +99,14 @@ const activeTour = computed<Tour | undefined>(() => {
   return tourStore.byExhibitionId(exhibition.value.id)[0];
 });
 
-const sceneKey = computed(() => `${three.ready.value}-${exhibition.value?.id}-${artifacts.value.map((item) => item.id).join('|')}`);
+const sceneKey = computed(() => {
+  const current = display.value;
+  if (!current) return `${three.ready.value}-none`;
+  const layoutKey = current.layout
+    .map((placement) => `${placement.artifactId}:${placement.slot}:${placement.rotation}:${placement.scale}`)
+    .join('|');
+  return `${three.ready.value}-${exhibition.value?.id}-${current.themeColor}-${current.artifactIds.join(',')}-${layoutKey}`;
+});
 
 function onSceneReady(element: HTMLElement) {
   containerRef.value = element;
@@ -94,19 +114,29 @@ function onSceneReady(element: HTMLElement) {
 }
 
 async function rebuildScene() {
-  if (!three.ready.value || !three.scene.value || !exhibition.value) return;
+  if (!three.ready.value || !three.scene.value || !display.value) return;
   if (sceneRoot) {
     three.scene.value.remove(sceneRoot);
     disposeObject3D(sceneRoot);
   }
 
-  const root = createGalleryHall(exhibition.value.themeColor);
+  const root = createGalleryHall(display.value.themeColor);
   const spacing = 4.1;
+  const layoutMap = new Map(display.value.layout.map((placement) => [placement.artifactId, placement]));
   await Promise.all(
     artifacts.value.map(async (artifact, index) => {
       const object = await loadArtifactObject(artifact);
-      object.position.set((index - (artifacts.value.length - 1) / 2) * spacing, 0, index % 2 === 0 ? -1.35 : 1.2);
-      object.rotation.y = index % 2 === 0 ? 0.16 : -0.24;
+      const placement = layoutMap.get(artifact.id);
+      if (placement) {
+        const transform = getSlotTransform(placement.slot);
+        object.position.set(...transform.position);
+        object.rotation.y = transform.rotationY + THREE.MathUtils.degToRad(placement.rotation);
+        object.scale.multiplyScalar(placement.scale);
+      } else {
+        // 没有布置数据时沿用自动排位
+        object.position.set((index - (artifacts.value.length - 1) / 2) * spacing, 0, index % 2 === 0 ? -1.35 : 1.2);
+        object.rotation.y = index % 2 === 0 ? 0.16 : -0.24;
+      }
       object.userData.artifactId = artifact.id;
       root.add(object);
     })
